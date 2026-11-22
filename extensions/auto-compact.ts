@@ -7,11 +7,15 @@ import {
 } from "node:fs";
 import { dirname, join } from "node:path";
 import {
+	compact,
 	DEFAULT_COMPACTION_SETTINGS,
 	estimateTokens,
 	getAgentDir,
+	type CompactionEntry,
 	type ExtensionAPI,
 	type ExtensionContext,
+	type FileOperations,
+	type ProjectedSessionEntry,
 } from "@earendil-works/pi-coding-agent";
 
 const DEFAULT_THRESHOLD = 78;
@@ -172,12 +176,55 @@ function isSoftCompactionError(error: Error): boolean {
 
 /** Pi's effective compaction settings, typed from the API so it tracks pi's own types. */
 type PiCompaction = ReturnType<ExtensionAPI["getSettings"]>["compaction"];
+type CompactionPreparation = Parameters<typeof compact>[0];
+type CompactSettings = CompactionPreparation["settings"];
+type CompactRetryPolicy = NonNullable<Parameters<typeof compact>[9]>;
+type BoundaryMessage = ProjectedSessionEntry["messages"][number];
+type CommandOptions = Parameters<ExtensionAPI["registerCommand"]>[1];
+type CompletionItems = NonNullable<
+	Awaited<ReturnType<NonNullable<CommandOptions["getArgumentCompletions"]>>>
+>;
+
+const COMMAND_COMPLETIONS: CompletionItems = [
+	{
+		value: "align on",
+		label: "align on",
+		description: "Sync Pi's own settings.json threshold to this value",
+	},
+	{
+		value: "align off",
+		label: "align off",
+		description: "Remove reserveTokens overrides written by this extension",
+	},
+	{
+		value: "reset",
+		label: "reset",
+		description: "Reset threshold to default (78%) and clear alignment",
+	},
+];
 
 function readPiCompaction(pi: ExtensionAPI): PiCompaction {
 	try {
 		return pi.getSettings().compaction;
 	} catch {
 		// getSettings() throws until the extension runtime finishes initializing.
+		return undefined;
+	}
+}
+
+function readPiRetryPolicy(pi: ExtensionAPI): CompactRetryPolicy | undefined {
+	try {
+		const retry = pi.getSettings().retry;
+		if (!retry) return undefined;
+		return {
+			enabled: retry.enabled ?? true,
+			maxRetries: retry.maxRetries ?? 3,
+			baseDelayMs: retry.baseDelayMs ?? 2000,
+			...(retry.maxAgentDelayMs !== undefined
+				? { maxAgentDelayMs: retry.maxAgentDelayMs }
+				: {}),
+		};
+	} catch {
 		return undefined;
 	}
 }
@@ -191,6 +238,21 @@ function piReserveTokens(compaction: PiCompaction, key: string): number {
 	);
 }
 
+function nonNegativeSafeInt(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+		? value
+		: undefined;
+}
+
+/** Resolve Pi's keepRecentTokens with the same override fallback rules Pi uses. */
+function piKeepRecentTokens(compaction: PiCompaction, key: string): number {
+	return (
+		nonNegativeSafeInt(compaction?.modelOverrides?.[key]?.keepRecentTokens) ??
+		nonNegativeSafeInt(compaction?.keepRecentTokens) ??
+		DEFAULT_COMPACTION_SETTINGS.keepRecentTokens
+	);
+}
+
 /** Percent of the context window at which Pi's own threshold checks start compacting. */
 function piTriggerPercent(
 	compaction: PiCompaction,
@@ -200,6 +262,221 @@ function piTriggerPercent(
 	return (
 		((contextWindow - piReserveTokens(compaction, key)) / contextWindow) * 100
 	);
+}
+
+function isTurnStartMessage(message: BoundaryMessage): boolean {
+	switch (message.role) {
+		case "user":
+		case "bashExecution":
+		case "custom":
+		case "branchSummary":
+		case "compactionSummary":
+			return true;
+		default:
+			return false;
+	}
+}
+
+function isCutPointMessage(message: BoundaryMessage): boolean {
+	return message.role === "assistant" || isTurnStartMessage(message);
+}
+
+function extractCompactionMessages(entry: ProjectedSessionEntry): BoundaryMessage[] {
+	if (entry.sourceEntry.type === "compaction") return [];
+	// System messages belong to prompt state, not summarized conversation turns.
+	return entry.messages.filter((message) => message.role !== "system");
+}
+
+function recordFileOp(
+	toolName: string,
+	args: unknown,
+	fileOps: FileOperations,
+): void {
+	if (typeof args !== "object" || args === null) return;
+	const path = (args as { path?: unknown }).path;
+	if (typeof path !== "string" || path.length === 0) return;
+	switch (toolName) {
+		case "read":
+			fileOps.read.add(path);
+			break;
+		case "write":
+			fileOps.written.add(path);
+			break;
+		case "edit":
+			fileOps.edited.add(path);
+			break;
+	}
+}
+
+function extractFileOpsFromMessage(
+	message: BoundaryMessage,
+	fileOps: FileOperations,
+): void {
+	if (message.role === "toolResult") {
+		for (const call of message.nestedCalls?.calls ?? []) {
+			recordFileOp(call.name, call.arguments, fileOps);
+		}
+		return;
+	}
+	if (message.role !== "assistant" || !Array.isArray(message.content)) return;
+	for (const block of message.content) {
+		if (typeof block !== "object" || block === null) continue;
+		if (block.type !== "toolCall") continue;
+		recordFileOp(block.name, block.arguments, fileOps);
+	}
+}
+
+function collectFileOperations(
+	messages: readonly BoundaryMessage[],
+	prevCompaction: CompactionEntry | undefined,
+): FileOperations {
+	const fileOps: FileOperations = {
+		read: new Set(),
+		written: new Set(),
+		edited: new Set(),
+	};
+	if (prevCompaction?.details && typeof prevCompaction.details === "object") {
+		const details = prevCompaction.details as {
+			readFiles?: unknown;
+			modifiedFiles?: unknown;
+		};
+		if (Array.isArray(details.readFiles)) {
+			for (const file of details.readFiles) {
+				if (typeof file === "string") fileOps.read.add(file);
+			}
+		}
+		if (Array.isArray(details.modifiedFiles)) {
+			for (const file of details.modifiedFiles) {
+				if (typeof file === "string") fileOps.edited.add(file);
+			}
+		}
+	}
+	for (const message of messages) {
+		extractFileOpsFromMessage(message, fileOps);
+	}
+	return fileOps;
+}
+
+/**
+ * Prepare a compaction cut point directly from a `turn_end` boundary's projected
+ * entries, mirroring Pi's own `prepareCompaction` cut rules without cutting at
+ * tool results or picking ephemeral preview entries from earlier drafts.
+ */
+function prepareBoundaryCompaction(
+	projectedEntries: readonly ProjectedSessionEntry[],
+	settings: CompactSettings,
+	tokensBefore: number,
+	isPersistedEntry?: (id: string) => boolean,
+): CompactionPreparation | undefined {
+	if (
+		projectedEntries.length > 0 &&
+		projectedEntries[projectedEntries.length - 1]!.sourceEntry.type === "compaction"
+	) {
+		return undefined;
+	}
+	const prevCompactionIndex = projectedEntries.findIndex(
+		(entry) => entry.sourceEntry.type === "compaction" && entry.messages.length > 0,
+	);
+	const prevCompaction =
+		prevCompactionIndex >= 0
+			? (projectedEntries[prevCompactionIndex]!.sourceEntry as CompactionEntry)
+			: undefined;
+	const previousSummary = prevCompaction?.summary;
+	const boundaryStart = prevCompactionIndex >= 0 ? prevCompactionIndex + 1 : 0;
+	const boundaryEnd = projectedEntries.length;
+
+	const cutPoints: number[] = [];
+	for (let i = boundaryStart; i < boundaryEnd; i++) {
+		const entry = projectedEntries[i]!;
+		if (
+			entry.sourceEntry.type !== "compaction" &&
+			(!isPersistedEntry || isPersistedEntry(entry.sourceEntry.id)) &&
+			entry.messages.some(isCutPointMessage)
+		) {
+			cutPoints.push(i);
+		}
+	}
+	if (cutPoints.length === 0) return undefined;
+
+	let accumulatedTokens = 0;
+	let cutIndex = cutPoints[0]!;
+	for (let i = boundaryEnd - 1; i >= boundaryStart; i--) {
+		const messageTokens = projectedEntries[i]!.messages.reduce(
+			(sum, message) => sum + estimateTokens(message),
+			0,
+		);
+		if (messageTokens === 0) continue;
+		accumulatedTokens += messageTokens;
+		if (accumulatedTokens >= settings.keepRecentTokens) {
+			cutIndex =
+				cutPoints.find((candidate) => candidate >= i) ??
+				cutPoints[cutPoints.length - 1]!;
+			break;
+		}
+	}
+
+	// Include preceding context-invisible persisted metadata entries inside the kept slice.
+	while (cutIndex > boundaryStart) {
+		const previous = projectedEntries[cutIndex - 1]!;
+		if (
+			previous.sourceEntry.type === "compaction" ||
+			previous.messages.length > 0 ||
+			(isPersistedEntry && !isPersistedEntry(previous.sourceEntry.id))
+		) {
+			break;
+		}
+		cutIndex--;
+	}
+
+	const cutEntry = projectedEntries[cutIndex]!;
+	const startsTurn =
+		cutEntry.sourceEntry.type !== "compaction" &&
+		cutEntry.messages.some(isTurnStartMessage);
+	let turnStartIndex = -1;
+	if (!startsTurn) {
+		for (let i = cutIndex; i >= boundaryStart; i--) {
+			const entry = projectedEntries[i]!;
+			if (
+				entry.sourceEntry.type !== "compaction" &&
+				entry.messages.some(isTurnStartMessage)
+			) {
+				turnStartIndex = i;
+				break;
+			}
+		}
+	}
+	const isSplitTurn = !startsTurn && turnStartIndex !== -1;
+
+	const firstKeptEntryId = cutEntry.sourceEntry.id;
+	if (!firstKeptEntryId) return undefined;
+
+	const historyEnd = isSplitTurn ? turnStartIndex : cutIndex;
+	const messagesToSummarize = projectedEntries
+		.slice(boundaryStart, historyEnd)
+		.flatMap(extractCompactionMessages);
+	const turnPrefixMessages = isSplitTurn
+		? projectedEntries
+				.slice(turnStartIndex, cutIndex)
+				.flatMap(extractCompactionMessages)
+		: [];
+	if (messagesToSummarize.length === 0 && turnPrefixMessages.length === 0) {
+		return undefined;
+	}
+
+	const fileOps = collectFileOperations(
+		[...messagesToSummarize, ...turnPrefixMessages],
+		prevCompaction,
+	);
+	return {
+		firstKeptEntryId,
+		messagesToSummarize,
+		turnPrefixMessages,
+		isSplitTurn,
+		tokensBefore,
+		previousSummary,
+		fileOps,
+		settings,
+	};
 }
 
 export default function (pi: ExtensionAPI) {
@@ -239,11 +516,9 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	/**
-	 * Point Pi's own compaction threshold at the configured percentage for one
-	 * model, by writing a `compaction.modelOverrides` reserve: Pi compacts
-	 * whenever projected tokens exceed `contextWindow - reserveTokens`, and that
-	 * check also runs between tool batches, so aligning it is what makes a
-	 * mid-run compaction happen at our threshold and the run continue.
+	 * Point Pi's own built-in compaction threshold in `settings.json` at the
+	 * configured percentage for one model, by writing a `compaction.modelOverrides`
+	 * reserve: Pi compacts whenever projected tokens exceed `contextWindow - reserveTokens`.
 	 *
 	 * A reserve we did not write belongs to the user and is never touched.
 	 */
@@ -294,10 +569,12 @@ export default function (pi: ExtensionAPI) {
 			const block = { ...((file.compaction ?? {}) as Record<string, unknown>) };
 			const overrides = { ...((block.modelOverrides ?? {}) as Record<string, unknown>) };
 			for (const [key, reserveTokens] of managed) {
-				const override = overrides[key] as { reserveTokens?: number } | undefined;
+				const override = overrides[key] as Record<string, unknown> | undefined;
 				// Leave a reserve the user has since changed alone.
 				if (override?.reserveTokens !== reserveTokens) continue;
-				delete overrides[key];
+				const { reserveTokens: _dropped, ...remaining } = override;
+				if (Object.keys(remaining).length > 0) overrides[key] = remaining;
+				else delete overrides[key];
 				changed = true;
 			}
 			if (Object.keys(overrides).length > 0) block.modelOverrides = overrides;
@@ -334,10 +611,15 @@ export default function (pi: ExtensionAPI) {
 
 	/** One-line description of where Pi's own compaction currently kicks in. */
 	const describePiTrigger = (ctx: ExtensionContext): string | undefined => {
-		const key = modelKey(ctx.model);
-		const contextWindow = ctx.model?.contextWindow ?? 0;
-		if (!key || contextWindow <= 0) return undefined;
 		const compaction = readPiCompaction(pi);
+		if (compaction?.enabled === false) {
+			return "Pi built-in auto-compaction: disabled";
+		}
+		const key = modelKey(ctx.model);
+		const modelWindow = ctx.model?.contextWindow ?? 0;
+		const contextWindow =
+			modelWindow > 0 ? modelWindow : (ctx.getContextUsage()?.contextWindow ?? 0);
+		if (!key || contextWindow <= 0) return undefined;
 		const current = compaction?.modelOverrides?.[key]?.reserveTokens;
 		const owned = current !== undefined && current === config.alignedReserveTokens[key];
 		const origin =
@@ -346,7 +628,7 @@ export default function (pi: ExtensionAPI) {
 				: owned
 					? "set by pi-auto-compact"
 					: "your settings";
-		return `Pi compacts mid-run at ${piTriggerPercent(compaction, key, contextWindow).toFixed(0)}% (reserveTokens ${piReserveTokens(compaction, key)}, ${origin})`;
+		return `Pi built-in compaction triggers at ${piTriggerPercent(compaction, key, contextWindow).toFixed(0)}% (reserveTokens ${piReserveTokens(compaction, key)}, ${origin})`;
 	};
 
 	/**
@@ -394,8 +676,19 @@ export default function (pi: ExtensionAPI) {
 		refreshAlignment(ctx, event.model);
 	});
 
+	pi.on("session_compact", (_event, ctx) => {
+		setStatusOnce(ctx, undefined);
+	});
+
 	pi.registerCommand("compact-threshold", {
 		description: `Show or set the auto-compaction threshold (usage: /compact-threshold [${MIN_THRESHOLD}-${MAX_THRESHOLD - 1}] | align on|off | reset)`,
+		getArgumentCompletions: (argumentPrefix) => {
+			const query = argumentPrefix.trimStart().toLowerCase().replace(/\s+/g, " ");
+			const matches = COMMAND_COMPLETIONS.filter((item) =>
+				item.value.startsWith(query),
+			);
+			return matches.length > 0 ? matches : null;
+		},
 		handler: async (args, ctx) => {
 			// Hot reload first: the value may have changed in another session.
 			config = loadConfig(config);
@@ -416,18 +709,18 @@ export default function (pi: ExtensionAPI) {
 						const changed = clearPiAlignment();
 						ctx.ui.notify(
 							changed
-								? "Mid-run compaction back to pi's own threshold — run /reload to apply"
-								: "Mid-run compaction back to pi's own threshold",
+								? "Pi's built-in compaction back to its own threshold — run /reload to apply"
+								: "Pi's built-in compaction back to its own threshold",
 							"info",
 						);
 					} else {
 						const result = syncPiThreshold(ctx.model);
 						ctx.ui.notify(
 							result === "aligned"
-								? `Mid-run compaction now follows ${config.threshold}% for ${modelKey(ctx.model) ?? "the current model"} — run /reload to apply`
+								? `Pi's built-in compaction now follows ${config.threshold}% for ${modelKey(ctx.model) ?? "the current model"} — run /reload to apply`
 								: result === "owned-by-user"
 									? "Pi already has a compaction budget for this model; leaving it alone"
-									: "Mid-run compaction follows the threshold (nothing to write)",
+									: "Pi's built-in compaction follows the threshold (nothing to write)",
 							result === "owned-by-user" ? "warning" : "info",
 						);
 					}
@@ -441,25 +734,26 @@ export default function (pi: ExtensionAPI) {
 
 			if (!head) {
 				const lines = [
-					`Auto-compaction threshold: ${config.threshold}%`,
-					describePiTrigger(ctx) ?? "Pi compaction: model context window unknown",
+					`Auto-compaction threshold: ${config.threshold}% (before prompts & after tool batches)`,
+					describePiTrigger(ctx) ?? "Pi built-in compaction: model context window unknown",
 				];
-				if (!config.alignPiThreshold)
-					lines.push(
-						`Run /compact-threshold align on to compact mid-run at ${config.threshold}% too`,
-					);
+				if (config.alignPiThreshold) {
+					lines.push("Pi threshold alignment: on");
+				}
 				ctx.ui.notify(lines.join("\n"), "info");
 				return;
 			}
 
 			if (input === "reset") {
 				try {
-					clearPiAlignment();
+					const changed = clearPiAlignment();
 					rmSync(CONFIG_FILE, { force: true });
 					config = defaultConfig();
 					lastStatus = undefined;
 					ctx.ui.notify(
-						`Auto-compaction threshold reset to ${config.threshold}%`,
+						changed
+							? `Auto-compaction threshold reset to ${config.threshold}% — run /reload to apply Pi settings`
+							: `Auto-compaction threshold reset to ${config.threshold}%`,
 						"info",
 					);
 				} catch {
@@ -501,9 +795,11 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	// Status-only: show when the context is already past the threshold and the next
-	// prompt will trigger a preflight compaction. No compaction happens here.
-	pi.on("turn_end", (_event, ctx) => {
+	// Mid-run actionable boundary: when context exceeds the threshold and the run
+	// will continue into another model request (e.g. tool results or pending queued
+	// messages), summarize earlier turns via a CompactionEntryDraft so Pi rebuilds
+	// context and continues seamlessly without aborting the run.
+	pi.on("turn_end", async (event, ctx) => {
 		config = loadConfig(config);
 		const usage = getValidUsage(ctx);
 		if (!usage) {
@@ -511,36 +807,132 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 		const percent = (usage.tokens / usage.contextWindow) * 100;
-		if (percent >= config.threshold) {
+		if (percent < config.threshold) {
+			setStatusOnce(ctx, undefined);
+			return;
+		}
+
+		const outcome = event.outcome ?? "completed";
+		const willContinue =
+			(event.toolResults?.length ?? 0) > 0 ||
+			(event.context?.pendingMessages?.length ?? 0) > 0 ||
+			Boolean(event.continue);
+		const alreadyCompacting =
+			Array.isArray(event.entries) &&
+			event.entries.some((entry) => entry.type === "compaction");
+		if (alreadyCompacting) {
+			setStatusOnce(ctx, undefined);
+			return;
+		}
+		if (!willContinue || outcome !== "completed") {
 			// Pi's own status bar already shows usage/window; only add the actionable hint.
 			setStatusOnce(ctx, "compact before next prompt", "warning");
-		} else {
+			return;
+		}
+		if (!ctx.model || !ctx.modelRegistry?.streamSimple || !event.context?.contextEntries) {
+			setStatusOnce(ctx, "compact before next prompt", "warning");
+			return;
+		}
+
+		const key = modelKey(ctx.model) ?? "";
+		const compaction = readPiCompaction(pi);
+		const isPersistedEntry = ctx.sessionManager?.getEntry
+			? (id: string) => ctx.sessionManager.getEntry(id) !== undefined
+			: undefined;
+		const preparation = prepareBoundaryCompaction(
+			event.context.contextEntries,
+			{
+				enabled: true,
+				reserveTokens: piReserveTokens(compaction, key),
+				keepRecentTokens: piKeepRecentTokens(compaction, key),
+			},
+			usage.tokens,
+			isPersistedEntry,
+		);
+		if (!preparation) {
+			setStatusOnce(
+				ctx,
+				`context ${percent.toFixed(0)}% · nothing earlier to compact yet`,
+				"warning",
+			);
+			return;
+		}
+
+		const gen = sessionGeneration;
+		// Capture signal before awaiting: Pi's ctx.signal getter throws if the session reloads/disposes mid-flight.
+		const signal = ctx.signal;
+		setStatusOnce(
+			ctx,
+			`context ${percent.toFixed(0)}% · compacting before next turn`,
+			"warning",
+		);
+		try {
+			const result = await compact(
+				preparation,
+				ctx.model,
+				undefined,
+				undefined,
+				undefined,
+				signal,
+				ctx.thinkingLevel,
+				(model, context, options) =>
+					ctx.modelRegistry.streamSimple(
+						model,
+						context,
+						options as Parameters<typeof ctx.modelRegistry.streamSimple>[2],
+					),
+				undefined,
+				readPiRetryPolicy(pi),
+			);
+			if (gen !== sessionGeneration || signal?.aborted) {
+				return;
+			}
 			setStatusOnce(ctx, undefined);
+			return {
+				entries: [
+					...(event.entries ?? []),
+					{
+						type: "compaction" as const,
+						summary: result.summary,
+						firstKeptEntryId: result.firstKeptEntryId,
+						details: result.details,
+						usage: result.usage,
+					},
+				],
+			};
+		} catch (error) {
+			if (gen !== sessionGeneration || signal?.aborted) {
+				return;
+			}
+			const message = error instanceof Error ? error.message : String(error);
+			setStatusOnce(ctx, "mid-run compact failed", "error");
+			notifySafe(
+				ctx,
+				`Mid-run auto-compact failed: ${message}. Continuing without compaction.`,
+				"warning",
+			);
+			return;
 		}
 	});
 
-	// Mid-run check: context grows with every tool result, and Pi only compacts
-	// between tool batches (AgentSession.prepareNextTurn), not before a call. This
-	// handler deliberately never compacts — ctx.compact() aborts the running turn
-	// (verified on pi 0.99.1) and drops the turn's work. It only reports which
-	// compaction is pending: ours before the next prompt, Pi's after this batch.
+	// Mid-run status: context grows with tool calls, and actual mid-run compaction
+	// happens after the current tool batch finishes (in turn_end) so sibling tool
+	// calls complete first and ctx.compact() never aborts an active turn.
 	pi.on("tool_call", (_event, ctx) => {
+		config = loadConfig(config);
 		const usage = getValidUsage(ctx);
-		if (!usage) return;
+		if (!usage) {
+			setStatusOnce(ctx, undefined);
+			return;
+		}
 		const percent = (usage.tokens / usage.contextWindow) * 100;
 		if (percent < config.threshold) {
 			setStatusOnce(ctx, undefined);
 			return;
 		}
-		const key = modelKey(ctx.model);
-		const trigger = key
-			? piTriggerPercent(readPiCompaction(pi), key, usage.contextWindow)
-			: undefined;
 		setStatusOnce(
 			ctx,
-			trigger !== undefined && percent >= trigger
-				? `context ${percent.toFixed(0)}% · compacting after this tool batch`
-				: `context ${percent.toFixed(0)}% · pi compacts at ${trigger?.toFixed(0) ?? "?"}% between tool batches`,
+			`context ${percent.toFixed(0)}% · compacting after this tool batch`,
 			"warning",
 		);
 	});

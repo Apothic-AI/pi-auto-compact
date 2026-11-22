@@ -9,5 +9,5 @@
     "allowImportingTsExtensions": true,
     "types": ["node"]
   },
-  "files": ["extensions/auto-compact.ts", "test/smoke.ts"]
+  "files": ["extensions/auto-compact.ts", "test/smoke.ts", "test/integration.ts"]
 }

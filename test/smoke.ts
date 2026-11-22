@@ -18,6 +18,10 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "no
 import { after, test } from "node:test";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import {
+	createAssistantMessageEventStream,
+	type AssistantMessage,
+} from "@earendil-works/pi-ai";
 
 const agentDir = mkdtempSync(join(tmpdir(), "pi-auto-compact-smoke-"));
 process.env.PI_CODING_AGENT_DIR = agentDir;
@@ -37,12 +41,26 @@ type Handler = (event: any, ctx: any) => any;
 interface MockPi {
 	pi: any;
 	events: Map<string, Handler[]>;
-	commands: Map<string, { description: string; handler: Handler }>;
+	commands: Map<
+		string,
+		{
+			description: string;
+			getArgumentCompletions?: (prefix: string) => any;
+			handler: Handler;
+		}
+	>;
 }
 
 function makePi(): MockPi {
 	const events = new Map<string, Handler[]>();
-	const commands = new Map<string, { description: string; handler: Handler }>();
+	const commands = new Map<
+		string,
+		{
+			description: string;
+			getArgumentCompletions?: (prefix: string) => any;
+			handler: Handler;
+		}
+	>();
 	const pi = {
 		on(name: string, handler: Handler) {
 			if (!events.has(name)) events.set(name, []);
@@ -50,7 +68,11 @@ function makePi(): MockPi {
 		},
 		registerCommand(
 			name: string,
-			def: { description: string; handler: Handler },
+			def: {
+				description: string;
+				getArgumentCompletions?: (prefix: string) => any;
+				handler: Handler;
+			},
 		) {
 			commands.set(name, def);
 		},
@@ -72,9 +94,19 @@ function install(pi: MockPi) {
 	return {
 		fireInput: (event: any, ctx: any) =>
 			pi.events.get("input")![0]!({ source: "interactive", ...event }, ctx),
-		fireTurnEnd: (ctx: any) => pi.events.get("turn_end")!.map((h) => h({}, ctx)),
+		fireTurnEnd: async (ctx: any, event: any = {}) => {
+			const results = [];
+			for (const h of pi.events.get("turn_end")!) {
+				results.push(await h(event, ctx));
+			}
+			return results;
+		},
 		fireSessionStart: (ctx: any) =>
 			pi.events.get("session_start")!.map((h) => h({}, ctx)),
+		fireSessionCompact: (ctx: any) =>
+			pi.events
+				.get("session_compact")!
+				.map((h) => h({ compactionEntry: {}, fromExtension: false, reason: "manual", willRetry: false }, ctx)),
 		fireToolCall: (ctx: any, toolName = "bash") =>
 			pi.events.get("tool_call")!.map((h) => h({ toolName, input: {} }, ctx)),
 		fireModelSelect: (ctx: any) =>
@@ -97,16 +129,86 @@ interface CtxHarness {
 	notifies: { text: string; kind: string }[];
 }
 
+function makeAssistantResponse(text: string): AssistantMessage {
+	return {
+		role: "assistant",
+		api: "anthropic-messages",
+		provider: MODEL.provider,
+		model: MODEL.id,
+		content: [{ type: "text", text }],
+		stopReason: "stop",
+		usage: {
+			input: 100,
+			output: 20,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 120,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		timestamp: Date.now(),
+	};
+}
+
+function makeBoundaryContextEntries(entries: Array<{
+	id: string;
+	role: "user" | "assistant" | "toolResult";
+	text: string;
+	toolCallId?: string;
+	toolName?: string;
+}>) {
+	return entries.map((item) => {
+		const message =
+			item.role === "user"
+				? { role: "user", content: item.text, timestamp: Date.now() }
+				: item.role === "assistant"
+					? {
+							...makeAssistantResponse(item.text),
+							content: item.toolCallId
+								? [
+										{ type: "text", text: item.text },
+										{ type: "toolCall", id: item.toolCallId, name: item.toolName ?? "bash", arguments: {} },
+									]
+								: [{ type: "text", text: item.text }],
+						}
+					: {
+							role: "toolResult",
+							toolCallId: item.toolCallId ?? "call-1",
+							toolName: item.toolName ?? "bash",
+							content: [{ type: "text", text: item.text }],
+							isError: false,
+							timestamp: Date.now(),
+						};
+		return {
+			sourceEntry: {
+				type: "message",
+				id: item.id,
+				parentId: null,
+				timestamp: new Date().toISOString(),
+				message,
+			},
+			messages: [message],
+		};
+	});
+}
+
 function makeCtx(opts: {
 	usage?: { tokens: number | null; contextWindow: number };
 	onCompact?: (handlers: CompactHandler) => void;
 	model?: { provider: string; id: string; contextWindow: number } | undefined;
+	streamSimple?: (...args: any[]) => any;
+	signal?: AbortSignal;
+	thinkingLevel?: string;
 }): CtxHarness {
 	const compacts: CompactHandler[] = [];
 	const harness: CtxHarness = {
 		ctx: {
 			hasUI: true,
 			model: "model" in opts ? opts.model : MODEL,
+			signal: opts.signal,
+			thinkingLevel: opts.thinkingLevel ?? "off",
+			modelRegistry: opts.streamSimple
+				? { streamSimple: opts.streamSimple }
+				: undefined,
 			getContextUsage: () => opts.usage,
 			compact(handlers: CompactHandler) {
 				compacts.push(handlers);
@@ -309,10 +411,10 @@ test("turn_end status reflects the threshold and clears below it", async () => {
 	try {
 		const pi = install(makePi());
 		const hot = makeCtx({ usage: { tokens: 90, contextWindow: 100 } });
-		pi.fireTurnEnd(hot.ctx);
+		await pi.fireTurnEnd(hot.ctx);
 		assert.match(hot.statuses.at(-1)!, /compact before next prompt/);
 		const cool = makeCtx({ usage: { tokens: 10, contextWindow: 100 } });
-		pi.fireTurnEnd(cool.ctx);
+		await pi.fireTurnEnd(cool.ctx);
 		assert.equal(cool.statuses.at(-1), undefined);
 	} finally {
 		writeConfig({ threshold: 78 });
@@ -389,35 +491,42 @@ test("tool_call below threshold stays silent and never compacts", () => {
 	assert.equal(h.compacts.length, 0, "a tool call must never trigger ctx.compact()");
 });
 
-test("tool_call above threshold reports pi's own mid-run trigger", () => {
+test("tool_call above threshold reports mid-run compaction after the batch", () => {
 	const pi = install(makePi());
-	// 80% usage on a 1M window; pi's default reserve leaves a ~98% trigger.
 	const h = makeCtx({ usage: { tokens: 800_000, contextWindow: 1_000_000 } });
-	pi.fireToolCall(h.ctx);
-	assert.match(h.statuses.at(-1)!, /context 80% . pi compacts at 98% between tool batches/);
-	assert.equal(h.compacts.length, 0, "ctx.compact() aborts the run; never called here");
-});
-
-test("tool_call past pi's trigger reports a compaction after this batch", () => {
-	const pi = install(makePi());
-	const h = makeCtx({ usage: { tokens: 990_000, contextWindow: 1_000_000 } });
 	pi.fireToolCall(h.ctx, "read");
-	assert.match(h.statuses.at(-1)!, /context 99% . compacting after this tool batch/);
-	assert.equal(h.compacts.length, 0);
+	assert.match(h.statuses.at(-1)!, /context 80% . compacting after this tool batch/);
+	assert.equal(h.compacts.length, 0, "ctx.compact() aborts the run; never called here");
 	// Repeated identical checks must not re-write the status line.
 	const before = h.statuses.length;
 	pi.fireToolCall(h.ctx, "read");
 	assert.equal(h.statuses.length, before, "status writes are deduplicated");
 });
 
-test("tool_call without a model falls back to a generic pressure line", () => {
+test("tool_call clears stale status when usage becomes unknown and hot-reloads config", () => {
+	writeConfig({ threshold: 50 });
+	try {
+		const pi = install(makePi());
+		const h = makeCtx({ usage: { tokens: 60, contextWindow: 100 } });
+		pi.fireToolCall(h.ctx);
+		assert.match(h.statuses.at(-1)!, /context 60% . compacting after this tool batch/);
+
+		const unknown = makeCtx({ usage: { tokens: null, contextWindow: 100 } });
+		pi.fireToolCall(unknown.ctx);
+		assert.equal(unknown.statuses.at(-1), undefined);
+	} finally {
+		writeConfig({ threshold: 78 });
+	}
+});
+
+test("tool_call without a model still reports mid-run compaction pressure", () => {
 	const pi = install(makePi());
 	const h = makeCtx({
 		usage: { tokens: 90, contextWindow: 100 },
 		model: undefined,
 	});
 	pi.fireToolCall(h.ctx);
-	assert.match(h.statuses.at(-1)!, /context 90% . pi compacts at \?%/);
+	assert.match(h.statuses.at(-1)!, /context 90% . compacting after this tool batch/);
 });
 
 // --- pi threshold alignment ----------------------------------------------------
@@ -513,7 +622,7 @@ test("align off removes only the reserve this extension wrote", async () => {
 
 		const h = makeCtx({ usage: undefined });
 		await pi.command("compact-threshold").handler("align off", h.ctx);
-		assert.match(h.notifies.at(-1)!.text, /back to pi's own threshold/);
+		assert.match(h.notifies.at(-1)!.text, /back to its own threshold/);
 		const compaction = readPiSettings().compaction;
 		assert.deepEqual(compaction.keepRecentTokens, 20_000);
 		assert.deepEqual(compaction.modelOverrides, {
@@ -588,10 +697,7 @@ test("/compact-threshold hot-reloads the config written by another session", asy
 		await pi.command("compact-threshold").handler("", h.ctx);
 		const text = h.notifies.at(-1)!.text;
 		assert.match(text, /Auto-compaction threshold: 50%/);
-		assert.ok(
-			!/align on to compact mid-run/.test(text),
-			"the hint disappears once alignment is on elsewhere",
-		);
+		assert.match(text, /Pi threshold alignment: on/);
 	} finally {
 		writeConfig({ threshold: 78 });
 	}
@@ -605,13 +711,413 @@ test("/compact-threshold without arguments reports both thresholds", async () =>
 		const h = makeCtx({ usage: undefined });
 		await pi.command("compact-threshold").handler("", h.ctx);
 		const text = h.notifies.at(-1)!.text;
-		assert.match(text, /Auto-compaction threshold: 78%/);
-		assert.match(text, /Pi compacts mid-run at 98% \(reserveTokens 16384, pi default\)/);
-		assert.match(text, /align on to compact mid-run at 78%/);
+		assert.match(text, /Auto-compaction threshold: 78% \(before prompts & after tool batches\)/);
+		assert.match(text, /Pi built-in compaction triggers at 98% \(reserveTokens 16384, pi default\)/);
 
 		await pi.command("compact-threshold").handler("align", h.ctx);
 		assert.match(h.notifies.at(-1)!.text, /Usage: \/compact-threshold align on\|off/);
 	} finally {
 		writeConfig({ threshold: 78 });
+	}
+});
+
+// --- mid-run turn_end compaction & review fixes ------------------------------
+
+test("turn_end with toolResults compacts via CompactionEntryDraft without continue: true", async () => {
+	writeConfig({ threshold: 78 });
+	writePiSettings({ compaction: { keepRecentTokens: 1_000 } });
+	try {
+		const pi = install(makePi());
+		let summaryCalls = 0;
+		const h = makeCtx({
+			usage: { tokens: 800_000, contextWindow: 1_000_000 },
+			streamSimple: () => {
+				summaryCalls++;
+				const stream = createAssistantMessageEventStream();
+				const msg = makeAssistantResponse("Compacted summary");
+				stream.push({ type: "start", partial: msg });
+				stream.push({ type: "done", reason: "stop", message: msg });
+				return stream;
+			},
+		});
+		const contextEntries = makeBoundaryContextEntries([
+			{ id: "e1", role: "user", text: "old prompt " + "a".repeat(20_000) },
+			{ id: "e2", role: "assistant", text: "old answer" },
+			{ id: "e3", role: "user", text: "keep turn " + "b".repeat(4_000) },
+			{ id: "e4", role: "assistant", text: "calling tool", toolCallId: "c1" },
+			{ id: "e5", role: "toolResult", text: "tool output", toolCallId: "c1" },
+		]);
+		const priorDraft = { type: "custom", customType: "note", data: { keep: true } };
+		const [result] = await pi.fireTurnEnd(h.ctx, {
+			outcome: "completed",
+			toolResults: [{ role: "toolResult" }],
+			entries: [priorDraft],
+			continue: false,
+			context: { contextEntries, pendingMessages: [] },
+		});
+		assert.equal(summaryCalls, 1);
+		assert.equal(result.continue, undefined, "must not force continue: true");
+		assert.equal(result.entries.length, 2);
+		assert.deepEqual(result.entries[0], priorDraft);
+		assert.equal(result.entries[1].type, "compaction");
+		assert.equal(result.entries[1].summary, "Compacted summary");
+		assert.equal(result.entries[1].firstKeptEntryId, "e3");
+		assert.equal(h.statuses.at(-1), undefined, "clears status on success");
+	} finally {
+		writeConfig({ threshold: 78 });
+		rmSync(SETTINGS_FILE, { force: true });
+	}
+});
+
+test("turn_end skips mid-run compaction when nothing earlier, aborted, or already compacting", async () => {
+	writeConfig({ threshold: 78 });
+	writePiSettings({ compaction: { keepRecentTokens: 1_000 } });
+	try {
+		const pi = install(makePi());
+		let summaryCalls = 0;
+		const streamSimple = () => {
+			summaryCalls++;
+			const stream = createAssistantMessageEventStream();
+			const msg = makeAssistantResponse("Unused");
+			stream.push({ type: "start", partial: msg });
+			stream.push({ type: "done", reason: "stop", message: msg });
+			return stream;
+		};
+
+		// Single turn within keepRecentTokens: nothing earlier to summarize.
+		const single = makeCtx({
+			usage: { tokens: 800_000, contextWindow: 1_000_000 },
+			streamSimple,
+		});
+		const singleEntries = makeBoundaryContextEntries([
+			{ id: "e1", role: "user", text: "short" },
+			{ id: "e2", role: "assistant", text: "tool", toolCallId: "c1" },
+			{ id: "e3", role: "toolResult", text: "ok", toolCallId: "c1" },
+		]);
+		const [singleRes] = await pi.fireTurnEnd(single.ctx, {
+			outcome: "completed",
+			toolResults: [{ role: "toolResult" }],
+			entries: [],
+			context: { contextEntries: singleEntries, pendingMessages: [] },
+		});
+		assert.equal(singleRes, undefined);
+		assert.match(single.statuses.at(-1)!, /nothing earlier to compact yet/);
+
+		// Non-completed outcome skips mid-run compaction.
+		const aborted = makeCtx({
+			usage: { tokens: 800_000, contextWindow: 1_000_000 },
+			streamSimple,
+		});
+		const [abortedRes] = await pi.fireTurnEnd(aborted.ctx, {
+			outcome: "aborted",
+			toolResults: [{ role: "toolResult" }],
+			entries: [],
+			context: { contextEntries: singleEntries, pendingMessages: [] },
+		});
+		assert.equal(abortedRes, undefined);
+		assert.equal(aborted.statuses.at(-1), "compact before next prompt");
+
+		// Prior compaction draft from another extension skips duplicate compaction.
+		const dup = makeCtx({
+			usage: { tokens: 800_000, contextWindow: 1_000_000 },
+			streamSimple,
+		});
+		const [dupRes] = await pi.fireTurnEnd(dup.ctx, {
+			outcome: "completed",
+			toolResults: [{ role: "toolResult" }],
+			entries: [{ type: "compaction", summary: "other", firstKeptEntryId: "e2" }],
+			context: { contextEntries: singleEntries, pendingMessages: [] },
+		});
+		assert.equal(dupRes, undefined);
+		assert.equal(summaryCalls, 0);
+	} finally {
+		writeConfig({ threshold: 78 });
+		rmSync(SETTINGS_FILE, { force: true });
+	}
+});
+
+test("turn_end failure falls back gracefully without aborting the run", async () => {
+	writeConfig({ threshold: 78 });
+	writePiSettings({ compaction: { keepRecentTokens: 1_000 }, retry: { enabled: false } });
+	try {
+		const pi = install(makePi());
+		const h = makeCtx({
+			usage: { tokens: 800_000, contextWindow: 1_000_000 },
+			streamSimple: () => {
+				throw new Error("summary backend down");
+			},
+		});
+		const contextEntries = makeBoundaryContextEntries([
+			{ id: "e1", role: "user", text: "old prompt " + "a".repeat(20_000) },
+			{ id: "e2", role: "assistant", text: "calling tool", toolCallId: "c1" },
+			{ id: "e3", role: "toolResult", text: "b".repeat(8_000), toolCallId: "c1" },
+		]);
+		const [res] = await pi.fireTurnEnd(h.ctx, {
+			outcome: "completed",
+			toolResults: [{ role: "toolResult" }],
+			entries: [],
+			context: { contextEntries, pendingMessages: [] },
+		});
+		assert.equal(res, undefined);
+		assert.equal(h.statuses.at(-1), "mid-run compact failed");
+		assert.equal(h.notifies.at(-1)?.kind, "warning");
+		assert.match(h.notifies.at(-1)!.text, /Continuing without compaction/);
+	} finally {
+		writeConfig({ threshold: 78 });
+		rmSync(SETTINGS_FILE, { force: true });
+	}
+});
+
+test("session_compact clears stale compact-before-next-prompt status", async () => {
+	const pi = install(makePi());
+	const h = makeCtx({ usage: { tokens: 90, contextWindow: 100 } });
+	await pi.fireTurnEnd(h.ctx);
+	assert.equal(h.statuses.at(-1), "compact before next prompt");
+	pi.fireSessionCompact(h.ctx);
+	assert.equal(h.statuses.at(-1), undefined);
+});
+
+test("align off removes only reserveTokens and keeps user keepRecentTokens", async () => {
+	writeConfig({
+		threshold: 78,
+		alignPiThreshold: true,
+		alignedReserveTokens: { "deepseek/deepseek-flash": 220_000 },
+	});
+	writePiSettings({
+		compaction: {
+			modelOverrides: {
+				"deepseek/deepseek-flash": {
+					reserveTokens: 220_000,
+					keepRecentTokens: 32_000,
+				},
+			},
+		},
+	});
+	try {
+		const pi = install(makePi());
+		const h = makeCtx({ usage: undefined });
+		await pi.command("compact-threshold").handler("align off", h.ctx);
+		assert.deepEqual(readPiSettings().compaction, {
+			modelOverrides: {
+				"deepseek/deepseek-flash": { keepRecentTokens: 32_000 },
+			},
+		});
+	} finally {
+		writeConfig({ threshold: 78 });
+		rmSync(SETTINGS_FILE, { force: true });
+	}
+});
+
+test("reset reminds to /reload only when settings.json changed", async () => {
+	writeConfig({
+		threshold: 40,
+		alignPiThreshold: true,
+		alignedReserveTokens: { "deepseek/deepseek-flash": 600_000 },
+	});
+	writePiSettings({
+		compaction: { modelOverrides: { "deepseek/deepseek-flash": { reserveTokens: 600_000 } } },
+	});
+	try {
+		const pi = install(makePi());
+		const h = makeCtx({ usage: undefined });
+		await pi.command("compact-threshold").handler("reset", h.ctx);
+		assert.match(h.notifies.at(-1)!.text, /run \/reload to apply Pi settings/);
+
+		await pi.command("compact-threshold").handler("reset", h.ctx);
+		assert.doesNotMatch(h.notifies.at(-1)!.text, /\/reload/);
+	} finally {
+		writeConfig({ threshold: 78 });
+		rmSync(SETTINGS_FILE, { force: true });
+	}
+});
+
+test("describePiTrigger handles disabled compaction and virtual models", async () => {
+	writePiSettings({ compaction: { enabled: false } });
+	try {
+		const pi = install(makePi());
+		const disabled = makeCtx({ usage: undefined });
+		await pi.command("compact-threshold").handler("", disabled.ctx);
+		assert.match(disabled.notifies.at(-1)!.text, /Pi built-in auto-compaction: disabled/);
+
+		writePiSettings({ compaction: { enabled: true } });
+		const virtual = makeCtx({
+			model: { provider: "router", id: "auto", contextWindow: 0 },
+			usage: { tokens: 50_000, contextWindow: 200_000 },
+		});
+		await pi.command("compact-threshold").handler("", virtual.ctx);
+		assert.match(
+			virtual.notifies.at(-1)!.text,
+			/Pi built-in compaction triggers at 92% \(reserveTokens 16384, pi default\)/,
+		);
+	} finally {
+		writeConfig({ threshold: 78 });
+		rmSync(SETTINGS_FILE, { force: true });
+	}
+});
+
+test("/compact-threshold getArgumentCompletions filters subcommands", () => {
+	const pi = install(makePi());
+	const cmd = pi.command("compact-threshold");
+	assert.equal(cmd.getArgumentCompletions!("").length, 3);
+	assert.deepEqual(
+		cmd.getArgumentCompletions!("al").map((c: any) => c.value),
+		["align on", "align off"],
+	);
+	assert.deepEqual(
+		cmd.getArgumentCompletions!("align ").map((c: any) => c.value),
+		["align on", "align off"],
+	);
+	assert.deepEqual(
+		cmd.getArgumentCompletions!("re").map((c: any) => c.value),
+		["reset"],
+	);
+	assert.equal(cmd.getArgumentCompletions!("unknown"), null);
+});
+
+test("turn_end ignores stale ctx.signal getter after session switch during compaction", async () => {
+	writeConfig({ threshold: 78 });
+	writePiSettings({ compaction: { keepRecentTokens: 1_000 } });
+	try {
+		const pi = install(makePi());
+		let stale = false;
+		let resolveStarted!: () => void;
+		const started = new Promise<void>((resolve) => {
+			resolveStarted = resolve;
+		});
+		let finishStream!: () => void;
+		const h = makeCtx({
+			usage: { tokens: 800_000, contextWindow: 1_000_000 },
+			streamSimple: () => {
+				const stream = createAssistantMessageEventStream();
+				const msg = makeAssistantResponse("Stale summary");
+				stream.push({ type: "start", partial: msg });
+				finishStream = () => stream.push({ type: "done", reason: "stop", message: msg });
+				resolveStarted();
+				return stream;
+			},
+		});
+		Object.defineProperty(h.ctx, "signal", {
+			get() {
+				if (stale) throw new Error("This extension ctx is stale after session replacement");
+				return undefined;
+			},
+		});
+		const contextEntries = makeBoundaryContextEntries([
+			{ id: "e1", role: "user", text: "old " + "a".repeat(20_000) },
+			{ id: "e2", role: "user", text: "keep " + "b".repeat(5_000) },
+			{ id: "e3", role: "assistant", text: "call", toolCallId: "c1" },
+			{ id: "e4", role: "toolResult", text: "out", toolCallId: "c1" },
+		]);
+		const pending = pi.fireTurnEnd(h.ctx, {
+			outcome: "completed",
+			toolResults: [{ role: "toolResult" }],
+			entries: [],
+			context: { contextEntries, pendingMessages: [] },
+		});
+		await started;
+		stale = true;
+		pi.fireSessionStart(makeCtx({ usage: undefined }).ctx);
+		finishStream();
+		const [res] = await pending;
+		assert.equal(res, undefined);
+		assert.equal(h.notifies.length, 0);
+	} finally {
+		writeConfig({ threshold: 78 });
+		rmSync(SETTINGS_FILE, { force: true });
+	}
+});
+
+test("turn_end skips ephemeral preview draft IDs from earlier extensions when picking firstKeptEntryId", async () => {
+	writeConfig({ threshold: 78 });
+	writePiSettings({ compaction: { keepRecentTokens: 1_000 } });
+	try {
+		const pi = install(makePi());
+		const h = makeCtx({
+			usage: { tokens: 800_000, contextWindow: 1_000_000 },
+			streamSimple: () => {
+				const stream = createAssistantMessageEventStream();
+				const msg = makeAssistantResponse("Summary without preview id");
+				stream.push({ type: "start", partial: msg });
+				stream.push({ type: "done", reason: "stop", message: msg });
+				return stream;
+			},
+		});
+		const persistedIds = new Set(["e1", "e2", "e3"]);
+		h.ctx.sessionManager = {
+			getEntry: (id: string) => (persistedIds.has(id) ? { id } : undefined),
+		};
+		const contextEntries = makeBoundaryContextEntries([
+			{ id: "e1", role: "user", text: "old " + "a".repeat(20_000) },
+			{ id: "e2", role: "assistant", text: "call", toolCallId: "c1" },
+			{ id: "e3", role: "toolResult", text: "ok", toolCallId: "c1" },
+			{ id: "preview-draft-id", role: "user", text: "ephemeral draft " + "d".repeat(8_000) },
+		]);
+		const [res] = await pi.fireTurnEnd(h.ctx, {
+			outcome: "completed",
+			toolResults: [{ role: "toolResult" }],
+			entries: [{ type: "custom_message", customType: "other", content: "ephemeral", display: false }],
+			context: { contextEntries, pendingMessages: [] },
+		});
+		assert.equal(res.entries[1].type, "compaction");
+		assert.equal(res.entries[1].firstKeptEntryId, "e2");
+	} finally {
+		writeConfig({ threshold: 78 });
+		rmSync(SETTINGS_FILE, { force: true });
+	}
+});
+
+test("turn_end preserves cumulative readFiles and modifiedFiles across fromHook compactions", async () => {
+	writeConfig({ threshold: 78 });
+	writePiSettings({ compaction: { keepRecentTokens: 1_000 } });
+	try {
+		const pi = install(makePi());
+		const h = makeCtx({
+			usage: { tokens: 800_000, contextWindow: 1_000_000 },
+			streamSimple: () => {
+				const stream = createAssistantMessageEventStream();
+				const msg = makeAssistantResponse("Second compaction summary");
+				stream.push({ type: "start", partial: msg });
+				stream.push({ type: "done", reason: "stop", message: msg });
+				return stream;
+			},
+		});
+		const prevCompaction = {
+			type: "compaction",
+			id: "cmp-1",
+			parentId: null,
+			timestamp: new Date().toISOString(),
+			summary: "First summary",
+			firstKeptEntryId: "cmp-1",
+			tokensBefore: 100_000,
+			fromHook: true,
+			details: { readFiles: ["a.ts"], modifiedFiles: ["b.ts"] },
+		};
+		const contextEntries = [
+			{
+				sourceEntry: prevCompaction,
+				messages: [{ role: "compactionSummary", summary: "First summary", tokensBefore: 100_000, timestamp: Date.now() }],
+			},
+			...makeBoundaryContextEntries([
+				{ id: "e1", role: "user", text: "turn 1 " + "a".repeat(20_000) },
+				{ id: "e2", role: "user", text: "turn 2 " + "b".repeat(5_000) },
+				{ id: "e3", role: "assistant", text: "call", toolCallId: "c1" },
+				{ id: "e4", role: "toolResult", text: "ok", toolCallId: "c1" },
+			]),
+		];
+		const [res] = await pi.fireTurnEnd(h.ctx, {
+			outcome: "completed",
+			toolResults: [{ role: "toolResult" }],
+			entries: [],
+			context: { contextEntries, pendingMessages: [] },
+		});
+		assert.deepEqual(res.entries[0].details, {
+			readFiles: ["a.ts"],
+			modifiedFiles: ["b.ts"],
+		});
+		assert.match(res.entries[0].summary, /<read-files>\na\.ts\n<\/read-files>/);
+		assert.match(res.entries[0].summary, /<modified-files>\nb\.ts\n<\/modified-files>/);
+	} finally {
+		writeConfig({ threshold: 78 });
+		rmSync(SETTINGS_FILE, { force: true });
 	}
 });
