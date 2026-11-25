@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Fully configuration-driven threshold precedence: exact provider/model key (or model id), then configured wildcard pattern (most-specific match wins), then generic global fallback (78%). Model rules can be edited in JSON or with `/compact-threshold model <key-or-pattern> <percent|reset>`; applies consistently to preflight, between-tool-batch compaction, and status reporting. Example `"*/gpt-*": 40` is a config value only; no model-family default or branch exists in source.
+- Align uses the effective percentage to derive Pi's per-model `reserveTokens` only when explicitly enabled; it continues to leave explicit user-owned reserves untouched. No installer, live setting, or deployment behavior is changed by this source-only feature.
+
+### Policy note
+
+- Example policy arithmetic only: a configured 40% rule on a 1,050,000-token model window triggers at 420,000; the deployed explicit 500,000-token target is 47.62%. These remain separate policies; live settings are unchanged.
+
 ## [1.4.0] - 2026-11-23
 
 ### Added

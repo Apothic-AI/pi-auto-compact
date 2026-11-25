@@ -20,19 +20,21 @@ pi install git:github.com/Chasen-Liao/pi-auto-compact
 
 ## Configuration
 
-The default threshold is **78% used**. Change it inside Pi with:
+The generic fallback threshold is **78% used**, preserving existing behavior. All model-specific policies are configured in `~/.pi/agent/pi-auto-compact.json`; there is no model-family branch or model-specific default in code. Resolution is exact `provider/model` key, then matching configured wildcard pattern, then global `threshold`. If multiple wildcards match, the most-specific (fewest `*`, longest literal text) wins; ties use config insertion order.
 
-```text
-/compact-threshold 50
+```json
+{
+  "threshold": 78,
+  "modelThresholds": {
+    "*/gpt-*": 40,
+    "subrouter-gpt/gpt-6.2-sol": 47.62
+  }
+}
 ```
 
-Values are 30–98; 99 is rejected because compaction itself needs headroom. This saves the setting atomically (merging into the existing file, so other keys survive). Show the current settings:
+Here `*/gpt-*` makes the 40% value a config policy, while the exact key preserves the distinct 47.62% (500,001-token trigger on a 1,050,000-token window) policy. A 40% rule would trigger at 420,000. Edit the config map to add/change any model policy; `/compact-threshold model <key-or-pattern> <percent|reset>` edits any rule, and `/compact-threshold <percent>` changes the global fallback. Threshold values accept 30–98. The feature does not silently enable or change Pi settings. `/compact-threshold align on` remains an explicit opt-in to write Pi's mid-tool-loop `reserveTokens`; user-owned reserves are preserved. Show effective settings and match count with `/compact-threshold`.
 
-```text
-/compact-threshold
-```
-
-Reset to the default 78% (and remove any extension-managed Pi settings alignment):
+Reset to the default generic 78% (and remove extension-managed Pi settings alignment):
 
 ```text
 /compact-threshold reset
@@ -46,7 +48,7 @@ During a multi-turn agent run, context grows as tool calls execute. The extensio
 
 - **Automatic `turn_end` compaction (always on)**: when a turn completes with pending continuation (`toolResults`, queued steering/follow-up messages, or another extension's continuation request) and context usage has reached the configured threshold, the extension summarizes earlier turns via `compact()` and returns a `CompactionEntryDraft` through Pi's actionable `turn_end` boundary. Pi appends the compaction entry, rebuilds context with the summary plus recent turns (`keepRecentTokens`), and **continues the next model request seamlessly** without aborting the run or modifying `~/.pi/agent/settings.json`.
 - **The `tool_call` status check (always on)**: before every tool call, if usage is at or above the threshold, the footer shows `context XX% · compacting after this tool batch`. This check never blocks a tool and never calls `ctx.compact()` (which aborts active runs).
-- **Optional Pi threshold alignment (`align on|off`)**: if you also want Pi's built-in `prepareNextTurn` check (and `settings.json` per-model overrides) to match your threshold, `/compact-threshold align on` writes `compaction.modelOverrides["<provider>/<model>"].reserveTokens` into `~/.pi/agent/settings.json` (run `/reload` afterwards to apply). `align off` removes only the `reserveTokens` keys written by this extension, leaving any user-configured `keepRecentTokens` or user-owned reserves untouched.
+- **Optional Pi threshold alignment (`align on|off`)**: if you also want Pi's built-in mid-tool-loop check and `settings.json` per-model reserve to match the effective threshold, `/compact-threshold align on` writes `compaction.modelOverrides["<provider>/<model>"].reserveTokens` using exact-model > configured wildcard > global fallback (run `/reload` afterwards to apply). `align off` removes only the exact `reserveTokens` keys written by this extension, leaving other user-owned settings untouched.
 
 ```text
 /compact-threshold align on     # optional: also align Pi's settings.json reserve

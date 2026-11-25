@@ -45,7 +45,7 @@ npm view pi-auto-compact version
 - 不要 `sendUserMessage` 重发原 prompt（`input` 在 `prompt()` 内，会递归）；返回 `{action:"continue"}`。
 - 异步回调：`sessionGeneration` 守护 + UI try/catch。`input` 预检软错误（Nothing to compact / Already compacted）放行；硬错误拦下，↑键召回重发。
 - 不做压缩超时兜底（1.2.2 裁决：当前 before_compact 都同步返回，路径不可达）。
-- 配置 `~/.pi/agent/pi-auto-compact.json`（`getAgentDir()` / `PI_CODING_AGENT_DIR`）：`threshold` 区间 `[30, 99)`，`alignPiThreshold` 默认 false，`alignedReserveTokens` 记账。越界回退上一有效值；读写热加载；`updateJsonFile` 原子合并写。
+- 配置 `~/.pi/agent/pi-auto-compact.json`（`getAgentDir()` / `PI_CODING_AGENT_DIR`）：global `threshold` 默认为 78%，模型阈值完全配置化于 `modelThresholds`；运行时无模型名/模型家族分支或默认。优先级：精确 `provider/model`（或 id）> 配置中的 `*` wildcard（最具体优先）> global。可用 `"*/gpt-*": 40` 表达 40% 策略；这只是示例配置值，不是代码默认。`alignPiThreshold` 默认 false，`alignedReserveTokens` 记账。越界回退上一有效值；读写热加载；`updateJsonFile` 原子合并写。测试命令：`/compact-threshold [global%]`、`/compact-threshold model <key-or-pattern> <percent|reset>`、`/compact-threshold align on|off`。现有显式 500k 预留仍由 Pi 用户设置保护；未安装/未启用到 fleet。
 
 ## 验证与边界
 

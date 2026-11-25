@@ -37,37 +37,67 @@ const SETTINGS_FILE = join(getAgentDir(), "settings.json");
 const SOFT_COMPACT_ERRORS = ["Nothing to compact", "Already compacted"];
 
 interface PluginConfig {
-	/** Compact before sending a prompt once the projected context reaches this percent. */
+	/** Generic global fallback; remains 78% for backward compatibility. */
 	threshold: number;
-	/** Also aim Pi's own compaction threshold (the mid-run check between tool batches) at `threshold`. */
+	/** Exact model keys and configured wildcard/prefix rules, matched before the global fallback. */
+	modelThresholds: Record<string, number>;
+	/** Also aim Pi's own mid-tool-loop threshold at the effective percentage. */
 	alignPiThreshold: boolean;
-	/** reserveTokens this extension wrote, keyed by `provider/model`, so `align off` can undo exactly those. */
+	/** reserveTokens this extension wrote, keyed by provider/model, so align off can undo them. */
 	alignedReserveTokens: Record<string, number>;
 }
 
 function defaultConfig(): PluginConfig {
 	return {
 		threshold: DEFAULT_THRESHOLD,
+		modelThresholds: {},
 		alignPiThreshold: false,
 		alignedReserveTokens: {},
 	};
 }
 
+function validThreshold(value: unknown): value is number {
+	return typeof value === "number" && Number.isFinite(value) && value >= MIN_THRESHOLD && value < MAX_THRESHOLD;
+}
+
+function effectiveThreshold(config: PluginConfig, model: ExtensionContext["model"]): number {
+	if (!model) return config.threshold;
+	const exactKeys = [`${model.provider}/${model.id}`, model.id];
+	for (const key of exactKeys) {
+		if (validThreshold(config.modelThresholds[key])) return config.modelThresholds[key]!;
+	}
+
+	const candidates = Object.entries(config.modelThresholds)
+		.filter(([pattern, value]) => validThreshold(value) && pattern.includes("*"))
+		.map(([pattern, value], order) => ({ pattern, value, order, specificity: pattern.replace(/\*/g, "").length }))
+		.filter(({ pattern }) => {
+			const escaped = pattern
+				.split("*")
+				.map((part) => part.replace(/[|\\{}()[\]^$+?.]/g, "\\$&"))
+				.join(".*");
+			const expression = new RegExp(`^${escaped}$`, "i");
+			return expression.test(`${model.provider}/${model.id}`) || expression.test(model.id);
+		})
+		.sort((a, b) => b.specificity - a.specificity || a.order - b.order);
+	return candidates.length > 0 ? candidates[0]!.value : config.threshold;
+}
+
 function parseConfig(raw: unknown, fallback: PluginConfig): PluginConfig {
 	const source = (raw ?? {}) as Partial<PluginConfig>;
 	const { threshold, alignedReserveTokens } = source;
+	const modelThresholds: Record<string, number> = {};
+	if (source.modelThresholds && typeof source.modelThresholds === "object" && !Array.isArray(source.modelThresholds)) {
+		for (const [key, value] of Object.entries(source.modelThresholds)) {
+			if (key.length > 0 && validThreshold(value)) modelThresholds[key] = value;
+		}
+	}
 	return {
-		threshold:
-			typeof threshold === "number" &&
-			Number.isFinite(threshold) &&
-			threshold >= MIN_THRESHOLD &&
-			threshold < MAX_THRESHOLD
-				? threshold
-				: fallback.threshold,
+		threshold: validThreshold(threshold) ? threshold : fallback.threshold,
+		modelThresholds,
 		alignPiThreshold:
-			typeof source.alignPiThreshold === "boolean"
-				? source.alignPiThreshold
-				: fallback.alignPiThreshold,
+				typeof source.alignPiThreshold === "boolean"
+					? source.alignPiThreshold
+					: fallback.alignPiThreshold,
 		alignedReserveTokens:
 			alignedReserveTokens &&
 			typeof alignedReserveTokens === "object" &&
@@ -186,6 +216,11 @@ type CompletionItems = NonNullable<
 >;
 
 const COMMAND_COMPLETIONS: CompletionItems = [
+	{
+		value: "model",
+		label: "model",
+		description: "Set or clear an exact model or wildcard threshold rule",
+	},
 	{
 		value: "align on",
 		label: "align on",
@@ -504,6 +539,8 @@ export default function (pi: ExtensionAPI) {
 	const modelKey = (model: ExtensionContext["model"]): string | undefined =>
 		model ? `${model.provider}/${model.id}` : undefined;
 
+	const thresholdFor = (model: ExtensionContext["model"]): number => effectiveThreshold(config, model);
+
 	const rememberManaged = (key: string, reserveTokens: number): void => {
 		config.alignedReserveTokens = { ...config.alignedReserveTokens, [key]: reserveTokens };
 		writeConfig({ alignedReserveTokens: config.alignedReserveTokens });
@@ -544,9 +581,10 @@ export default function (pi: ExtensionAPI) {
 			if (managed !== undefined) forgetManaged(key);
 			return "owned-by-user";
 		}
+		const threshold = thresholdFor(model);
 		const reserveTokens = Math.max(
 			0,
-			Math.round(contextWindow * (1 - config.threshold / 100)),
+			Math.round(contextWindow * (1 - threshold / 100)),
 		);
 		if (current === reserveTokens) return "unchanged";
 		updateJsonFile(SETTINGS_FILE, (file) => {
@@ -604,7 +642,7 @@ export default function (pi: ExtensionAPI) {
 		}
 		notifySafe(
 			ctx,
-			`Pi compaction aligned to ${config.threshold}% for ${modelKey(model)} — run /reload to apply.`,
+			`Pi compaction aligned to ${thresholdFor(model)}% for ${modelKey(model)} — run /reload to apply.`,
 			"info",
 		);
 	};
@@ -628,7 +666,7 @@ export default function (pi: ExtensionAPI) {
 				: owned
 					? "set by pi-auto-compact"
 					: "your settings";
-		return `Pi built-in compaction triggers at ${piTriggerPercent(compaction, key, contextWindow).toFixed(0)}% (reserveTokens ${piReserveTokens(compaction, key)}, ${origin})`;
+		return `Pi built-in compaction triggers at ${piTriggerPercent(compaction, key, contextWindow).toFixed(0)}% (reserveTokens ${piReserveTokens(compaction, key)}, ${origin}); extension threshold ${thresholdFor(ctx.model)}%`;
 	};
 
 	/**
@@ -681,7 +719,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("compact-threshold", {
-		description: `Show or set the auto-compaction threshold (usage: /compact-threshold [${MIN_THRESHOLD}-${MAX_THRESHOLD - 1}] | align on|off | reset)`,
+		description: `Show or set compaction percentages (usage: /compact-threshold [global%] | model <key-or-pattern> <percent|reset> | align on|off | reset)`,
 		getArgumentCompletions: (argumentPrefix) => {
 			const query = argumentPrefix.trimStart().toLowerCase().replace(/\s+/g, " ");
 			const matches = COMMAND_COMPLETIONS.filter((item) =>
@@ -692,8 +730,37 @@ export default function (pi: ExtensionAPI) {
 		handler: async (args, ctx) => {
 			// Hot reload first: the value may have changed in another session.
 			config = loadConfig(config);
-			const [head, tail] = args.trim().split(/\s+/);
+			const [head, tail, extra] = args.trim().split(/\s+/);
 			const input = head?.toLowerCase() ?? "";
+
+			if (input === "model") {
+				const key = tail;
+				const action = extra?.toLowerCase();
+				if (!key || !action) {
+					ctx.ui.notify(`Usage: /compact-threshold model <key-or-pattern> <${MIN_THRESHOLD}-${MAX_THRESHOLD - 1}|reset>`, "warning");
+					return;
+				}
+				if (action === "reset") {
+					const { [key]: _removed, ...rest } = config.modelThresholds;
+					config.modelThresholds = rest;
+					writeConfig({ modelThresholds: rest });
+					config = loadConfig({ ...config, modelThresholds: rest });
+					ctx.ui.notify(`Model threshold rule cleared for ${key}`, "info");
+					refreshAlignment(ctx);
+					return;
+				}
+				const value = Number(action.replace(/%$/, ""));
+				if (!validThreshold(value)) {
+					ctx.ui.notify(`Usage: /compact-threshold model <key-or-pattern> <${MIN_THRESHOLD}-${MAX_THRESHOLD - 1}|reset>`, "warning");
+					return;
+				}
+				config.modelThresholds = { ...config.modelThresholds, [key]: value };
+				writeConfig({ modelThresholds: config.modelThresholds });
+				config = loadConfig({ ...config, modelThresholds: config.modelThresholds });
+				ctx.ui.notify(`Threshold rule ${key} set to ${value}%`, "info");
+				refreshAlignment(ctx);
+				return;
+			}
 
 			if (input === "align") {
 				const on = tail?.toLowerCase() === "on";
@@ -717,7 +784,7 @@ export default function (pi: ExtensionAPI) {
 						const result = syncPiThreshold(ctx.model);
 						ctx.ui.notify(
 							result === "aligned"
-								? `Pi's built-in compaction now follows ${config.threshold}% for ${modelKey(ctx.model) ?? "the current model"} — run /reload to apply`
+								? `Pi's built-in compaction now follows ${thresholdFor(ctx.model)}% for ${modelKey(ctx.model) ?? "the current model"} — run /reload to apply`
 								: result === "owned-by-user"
 									? "Pi already has a compaction budget for this model; leaving it alone"
 									: "Pi's built-in compaction follows the threshold (nothing to write)",
@@ -734,7 +801,9 @@ export default function (pi: ExtensionAPI) {
 
 			if (!head) {
 				const lines = [
-					`Auto-compaction threshold: ${config.threshold}% (before prompts & after tool batches)`,
+					`Auto-compaction threshold: ${thresholdFor(ctx.model)}% for ${modelKey(ctx.model) ?? "current model"} (before prompts & after tool batches)`,
+					`Global fallback: ${config.threshold}%`,
+					`Configured model rules: ${Object.keys(config.modelThresholds).length}`,
 					describePiTrigger(ctx) ?? "Pi built-in compaction: model context window unknown",
 				];
 				if (config.alignPiThreshold) {
@@ -788,7 +857,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			ctx.ui.notify(
-				`Auto-compaction threshold set to ${config.threshold}%`,
+				`Global fallback threshold set to ${config.threshold}%`,
 				"info",
 			);
 			refreshAlignment(ctx);
@@ -807,7 +876,8 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 		const percent = (usage.tokens / usage.contextWindow) * 100;
-		if (percent < config.threshold) {
+		const threshold = thresholdFor(ctx.model);
+		if (percent < threshold) {
 			setStatusOnce(ctx, undefined);
 			return;
 		}
@@ -926,7 +996,8 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 		const percent = (usage.tokens / usage.contextWindow) * 100;
-		if (percent < config.threshold) {
+		const threshold = thresholdFor(ctx.model);
+		if (percent < threshold) {
 			setStatusOnce(ctx, undefined);
 			return;
 		}
@@ -958,7 +1029,8 @@ export default function (pi: ExtensionAPI) {
 		const projected =
 			usage.tokens +
 			estimateTokens({ role: "user", content, timestamp: Date.now() });
-		if (projected < usage.contextWindow * (config.threshold / 100))
+		const threshold = thresholdFor(ctx.model);
+		if (projected < usage.contextWindow * (threshold / 100))
 			return { action: "continue" };
 
 		const gen = sessionGeneration;

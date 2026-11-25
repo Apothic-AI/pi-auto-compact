@@ -31,6 +31,8 @@ const CONFIG_FILE = join(agentDir, "pi-auto-compact.json");
 const SETTINGS_FILE = join(agentDir, "settings.json");
 /** deepseek-flash-shaped model: 1M window, so 78% leaves a 220k reserve. */
 const MODEL = { provider: "deepseek", id: "deepseek-flash", contextWindow: 1_000_000 };
+const GPT_MODEL = { provider: "subrouter-gpt", id: "gpt-6.2-sol", contextWindow: 1_050_000 };
+const OTHER_GPT_MODEL = { provider: "relayfast", id: "gpt-6-sol", contextWindow: 1_050_000 };
 
 const { default: createExtension } = await import(
 	"../extensions/auto-compact.ts"
@@ -531,6 +533,30 @@ test("tool_call without a model still reports mid-run compaction pressure", () =
 
 // --- pi threshold alignment ----------------------------------------------------
 
+test("configured pattern applies to matching providers, exact key overrides it, and unmatched models use global fallback", async () => {
+	writeConfig({ threshold: 78, modelThresholds: { "*/gpt-*": 40, "subrouter-gpt/gpt-6.2-sol": 47.62, "relayfast/gpt-6-sol*": 45 } });
+	try {
+		const pi = install(makePi());
+		const command = makeCtx({ model: MODEL, usage: undefined });
+		await pi.command("compact-threshold").handler("model */claude-* 55", command.ctx);
+		assert.equal(JSON.parse(readFileSync(CONFIG_FILE, "utf8")).modelThresholds["*/claude-*"], 55, "command writes arbitrary configured pattern");
+		writeConfig({ threshold: 78, modelThresholds: { "*/gpt-*": 40, "subrouter-gpt/gpt-6.2-sol": 47.62, "relayfast/gpt-6-sol*": 45 } });
+		const exact = makeCtx({ model: GPT_MODEL, usage: { tokens: 450_000, contextWindow: 1_050_000 } });
+		pi.fireToolCall(exact.ctx);
+		assert.equal(exact.statuses.at(-1), undefined, "exact 47.62 value wins over the matching 40% wildcard");
+
+		const pattern = makeCtx({ model: OTHER_GPT_MODEL, usage: { tokens: 480_000, contextWindow: 1_050_000 } });
+		pi.fireToolCall(pattern.ctx);
+		assert.match(pattern.statuses.at(-1)!, /compacting after this tool batch/, "most-specific configured wildcard wins");
+
+		const unmatched = makeCtx({ model: MODEL, usage: { tokens: 450_000, contextWindow: 1_000_000 } });
+		pi.fireToolCall(unmatched.ctx);
+		assert.equal(unmatched.statuses.at(-1), undefined, "unmatched model uses 78% global fallback");
+	} finally {
+		writeConfig({ threshold: 78 });
+	}
+});
+
 test("align on writes a per-model reserve so pi compacts mid-run at our threshold", async () => {
 	writeConfig({ threshold: 78 });
 	writePiSettings({ theme: "dark", compaction: { enabled: true } });
@@ -571,6 +597,50 @@ test("a model switch re-aligns the new model", () => {
 			220_000,
 		);
 		assert.match(h.notifies.at(-1)!.text, /aligned to 78%.*run \/reload to apply/);
+	} finally {
+		writeConfig({ threshold: 78 });
+		rmSync(SETTINGS_FILE, { force: true });
+	}
+});
+
+test("exact model percentage overrides configured wildcard and preserves a user-owned reserve", async () => {
+	writeConfig({ threshold: 78, modelThresholds: { "*/gpt-*": 40, "subrouter-gpt/gpt-6.2-sol": 47.62 }, alignPiThreshold: true });
+	writePiSettings({ compaction: { modelOverrides: { "subrouter-gpt/gpt-6.2-sol": { reserveTokens: 550_000 } } } });
+	try {
+		const pi = install(makePi());
+		const h = makeCtx({ model: GPT_MODEL, usage: undefined });
+		await pi.command("compact-threshold").handler("", h.ctx);
+		const report = h.notifies.find((item) => item.text.includes("Auto-compaction threshold: 47.62% for subrouter-gpt/gpt-6.2-sol"))?.text;
+		assert.ok(report, "status report uses exact model threshold");
+		assert.match(report, /Global fallback: 78%/);
+		assert.equal(readPiSettings().compaction.modelOverrides["subrouter-gpt/gpt-6.2-sol"].reserveTokens, 550_000,
+			"explicit 500k-policy reserve remains user-owned and untouched");
+
+		const gptBelowExact = makeCtx({ model: GPT_MODEL, usage: { tokens: 450_000, contextWindow: 1_050_000 } });
+		pi.fireToolCall(gptBelowExact.ctx);
+		assert.equal(gptBelowExact.statuses.at(-1), undefined, "exact 47.62% threshold overrides configured 40% wildcard");
+		const gptAboveExact = makeCtx({ model: GPT_MODEL, usage: { tokens: 501_000, contextWindow: 1_050_000 } });
+		pi.fireToolCall(gptAboveExact.ctx);
+		assert.match(gptAboveExact.statuses.at(-1)!, /context 48% · compacting after this tool batch/);
+
+		const deepseek = makeCtx({ model: MODEL, usage: { tokens: 450_000, contextWindow: 1_000_000 } });
+		pi.fireToolCall(deepseek.ctx);
+		assert.equal(deepseek.statuses.at(-1), undefined, "non-GPT model retains global 78% fallback");
+	} finally {
+		writeConfig({ threshold: 78 });
+		rmSync(SETTINGS_FILE, { force: true });
+	}
+});
+
+test("align computes reserve from configured model pattern when no user reserve exists", async () => {
+	writeConfig({ threshold: 78, modelThresholds: { "*/gpt-*": 40 }, alignPiThreshold: true });
+	writePiSettings({ compaction: { enabled: true } });
+	try {
+		const pi = install(makePi());
+		const h = makeCtx({ model: GPT_MODEL, usage: undefined });
+		pi.fireSessionStart(h.ctx);
+		assert.equal(readPiSettings().compaction.modelOverrides["subrouter-gpt/gpt-6.2-sol"].reserveTokens, 630_000,
+			"configured 40% of 1,050,000 leaves a 630,000-token reserve");
 	} finally {
 		writeConfig({ threshold: 78 });
 		rmSync(SETTINGS_FILE, { force: true });
@@ -711,7 +781,7 @@ test("/compact-threshold without arguments reports both thresholds", async () =>
 		const h = makeCtx({ usage: undefined });
 		await pi.command("compact-threshold").handler("", h.ctx);
 		const text = h.notifies.at(-1)!.text;
-		assert.match(text, /Auto-compaction threshold: 78% \(before prompts & after tool batches\)/);
+		assert.match(text, /Auto-compaction threshold: 78% for deepseek\/deepseek-flash \(before prompts & after tool batches\)/);
 		assert.match(text, /Pi built-in compaction triggers at 98% \(reserveTokens 16384, pi default\)/);
 
 		await pi.command("compact-threshold").handler("align", h.ctx);
@@ -958,7 +1028,7 @@ test("describePiTrigger handles disabled compaction and virtual models", async (
 test("/compact-threshold getArgumentCompletions filters subcommands", () => {
 	const pi = install(makePi());
 	const cmd = pi.command("compact-threshold");
-	assert.equal(cmd.getArgumentCompletions!("").length, 3);
+	assert.equal(cmd.getArgumentCompletions!("").length, 4);
 	assert.deepEqual(
 		cmd.getArgumentCompletions!("al").map((c: any) => c.value),
 		["align on", "align off"],

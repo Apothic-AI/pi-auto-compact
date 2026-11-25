@@ -36,9 +36,13 @@ const CONTEXT_WINDOW = 200_000;
 
 type Mode = "below-threshold" | "midrun" | "batch" | "preflight";
 
-async function runScenario(mode: Mode, threshold = 78) {
+async function runScenario(
+	mode: Mode,
+	threshold = 78,
+	modelThresholds: Record<string, number> = {},
+) {
 	const cwd = mkdtempSync(join(root, "workspace-"));
-	writeFileSync(CONFIG_FILE, JSON.stringify({ threshold }));
+	writeFileSync(CONFIG_FILE, JSON.stringify({ threshold, modelThresholds }));
 	writeFileSync(
 		SETTINGS_FILE,
 		JSON.stringify({
@@ -268,8 +272,12 @@ test("SDK: below configured threshold does not compact mid-run", async () => {
 	assert.ok(!entries.some((entry) => entry.type === "compaction"));
 });
 
-test("SDK: turn_end auto-compacts at threshold without align on and continues seamlessly", async () => {
-	const { trace, summaryCount, requests, entries } = await runScenario("midrun", 78);
+test("SDK: exact model percentage overrides global and still compacts mid-run without align on", async () => {
+	const { trace, summaryCount, requests, entries } = await runScenario(
+		"midrun",
+		95,
+		{ "anthropic/claude-sonnet-4-5": 80 },
+	);
 	// One split-turn compaction calls streamSimple twice (history + turn-prefix) and appends 1 compaction entry.
 	assert.equal(summaryCount, 2);
 	assert.deepEqual(
